@@ -6,7 +6,7 @@ connector shape for an agent platform built on the Claude Agent SDK.
 
 [![ci](https://github.com/VibhutiGoyal7/freshdesk-agent-connector/actions/workflows/ci.yml/badge.svg)](https://github.com/VibhutiGoyal7/freshdesk-agent-connector/actions/workflows/ci.yml)
 
-> **Verified live** on a Freshdesk trial (50 req/min plan) with a Claude agent driving three of the five tools over MCP — search → read two threads → two internal notes, in four seconds, rate-limit headroom logged on every call. Reproduce it with `npm run agent` below.
+> **Verified live** on a Freshdesk trial (50 req/min plan) with a Claude agent driving the connector over MCP: two searches, two thread reads, two internal notes, ~15 s end to end with connector latency of 150–400 ms per call and `rate_remaining` logged on every request (49 → 42). Reproduce it with `npm run agent` below; the read-only verification is in docs/REVIEW.md.
 
 ## If you have 60 seconds
 
