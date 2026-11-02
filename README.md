@@ -4,7 +4,9 @@ A private connector that lets an Agent Studio agent read a merchant's Freshdesk
 helpdesk and write back under guardrails. Shipped as an MCP server — the native
 connector shape for an agent platform built on the Claude Agent SDK.
 
-[![ci](https://github.com/OWNER/REPO/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/REPO/actions/workflows/ci.yml)
+[![ci](https://github.com/VibhutiGoyal7/freshdesk-agent-connector/actions/workflows/ci.yml/badge.svg)](https://github.com/VibhutiGoyal7/freshdesk-agent-connector/actions/workflows/ci.yml)
+
+> **Verified live** on a Freshdesk trial (50 req/min plan) with a Claude agent driving all five tools over MCP — search → read two threads → two internal notes, in four seconds, rate-limit headroom logged on every call. Reproduce it with `npm run agent` below.
 
 ## If you have 60 seconds
 
@@ -42,14 +44,16 @@ npm run evals            # 29 cases, recorded fixtures — no credentials, no ne
 ```bash
 cp .env.example .env     # Freshdesk subdomain + API key (Profile Settings → Your API Key)
 npm run build
+npm run seed             # creates 8 realistic merchant tickets in your trial helpdesk
 npm run smoke            # read-only against your real helpdesk; prints what the agent sees
 npm run smoke -- --write # also posts one internal note, proving the write path + idempotency
 ```
 
 ```bash
-ANTHROPIC_API_KEY=... npm run agent -- \
-  "Which open tickets are about failed autopay? Add an internal note on the top two."
+npm run agent -- "Which open tickets are about failed autopay? Add an internal note on the top two."
 ```
+
+Needs `ANTHROPIC_API_KEY` in `.env`.
 
 The last command is the end-to-end proof: it spawns the connector over stdio,
 hands its tool declarations to Claude, and runs the agent loop. `update_ticket`
