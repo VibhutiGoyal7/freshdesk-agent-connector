@@ -18,16 +18,18 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { createInterface } from "node:readline/promises";
 import { TOOLS } from "../src/tools/index.js";
+import { loadConfig } from "../src/config.js";
 
-const MODEL = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-5";
+const MODEL = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-5-5";
 const APPROVAL_REQUIRED = new Set(TOOLS.filter((t) => t.requiresApproval).map((t) => t.name));
 
 const SYSTEM = `You are a support-operations agent for a merchant that accepts payments through Razorpay.
 You can read the merchant's Freshdesk helpdesk and leave internal notes. You cannot and must not
 attempt to message customers. When you record a judgement, use add_private_note with a stable
-idempotency_key of the form triage-<ticket_id>-<today's date>. Be concise; cite ticket ids.`;
+idempotency_key of the form triage-<ticket_id>-<today's date>. Be concise; cite ticket ids. Notes are rendered as plain text in Freshdesk, so do not use markdown — no asterisks, no headings.`;
 
 async function main(): Promise<void> {
+  loadConfig();
   const task = process.argv.slice(2).join(" ").trim();
   if (!task) {
     console.error('Usage: npm run agent -- "<what you want the agent to do>"');

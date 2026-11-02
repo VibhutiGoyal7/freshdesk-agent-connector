@@ -7,6 +7,8 @@
  * instruction cannot make the agent reach another merchant's helpdesk.
  */
 
+import { existsSync, readFileSync } from "node:fs";
+
 export interface ConnectorConfig {
   /** Freshdesk subdomain, e.g. "acme" for acme.freshdesk.com */
   domain: string;
@@ -51,7 +53,29 @@ function intEnv(name: string, fallback: number): number {
   return n;
 }
 
+/**
+ * Load .env from the working directory if present. Real env vars win, so an
+ * agent host that injects credentials is unaffected; this only helps local
+ * runs (smoke, evals, the demo agent) on machines without direnv.
+ */
+function loadDotEnv(): void {
+  if (!existsSync(".env")) return;
+  for (const raw of readFileSync(".env", "utf8").split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq === -1) continue;
+    const key = line.slice(0, eq).trim();
+    let val = line.slice(eq + 1).trim();
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1);
+    }
+    if (process.env[key] === undefined) process.env[key] = val;
+  }
+}
+
 export function loadConfig(): ConnectorConfig {
+  loadDotEnv();
   return {
     domain: requireEnv("FRESHDESK_DOMAIN").replace(/\.freshdesk\.com$/i, ""),
     apiKey: requireEnv("FRESHDESK_API_KEY"),
