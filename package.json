@@ -1,0 +1,32 @@
+{
+  "name": "freshdesk-agent-connector",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Private connector (MCP server) exposing Freshdesk tickets to an Agent Studio agent",
+  "type": "module",
+  "bin": {
+    "freshdesk-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "evals": "tsx evals/run.ts",
+    "smoke": "tsx scripts/smoke.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "agent": "tsx examples/run-agent.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.3.0",
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
