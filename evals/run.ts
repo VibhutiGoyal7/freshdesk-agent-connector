@@ -14,8 +14,10 @@ import { ConnectorConfig } from "../src/config.js";
 import { FreshdeskClient } from "../src/freshdesk/client.js";
 import { FreshdeskError } from "../src/errors.js";
 import { TOOLS, ToolContext } from "../src/tools/index.js";
-import { recordedTransport, routes } from "./fixtures.js";
+import { TICKET_AUTOPAY, recordedTransport, routes } from "./fixtures.js";
 import { ConcurrencyGate, TokenBucket, backoffMs } from "../src/freshdesk/limiter.js";
+import { redactPii } from "../src/normalize.js";
+import { zodToJsonSchema } from "../src/schema.js";
 
 interface Case {
   name: string;
@@ -53,6 +55,36 @@ async function call(ctx: ToolContext, name: string, args: unknown): Promise<any>
 function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(msg);
 }
+
+/** Capture structured stderr lines emitted while fn runs, so audit claims can be asserted. */
+async function captureStderr(fn: () => Promise<void>): Promise<string[]> {
+  const lines: string[] = [];
+  const orig = process.stderr.write.bind(process.stderr);
+  (process.stderr as any).write = (chunk: unknown) => {
+    lines.push(String(chunk));
+    return true;
+  };
+  try {
+    await fn();
+  } finally {
+    (process.stderr as any).write = orig;
+  }
+  return lines;
+}
+
+/** A ticket whose embed is full (10 messages), so the connector must page the real thread. */
+const longThread = (total: number) => {
+  const conv = (id: number) => ({
+    id,
+    body_text: `<p>message ${id}</p>`,
+    incoming: id % 2 === 0,
+    private: false,
+    created_at: `2026-10-${String(1 + (id % 28)).padStart(2, "0")}T00:00:00Z`,
+  });
+  const ticket = { ...TICKET_AUTOPAY, conversations: Array.from({ length: 10 }, (_, i) => conv(i + 1)) };
+  const all = Array.from({ length: total }, (_, i) => conv(i + 1));
+  return { ticket, all };
+};
 
 const cases: Case[] = [
   // ---- Rate limiting, tested directly rather than only through the 429 path ----
@@ -416,6 +448,218 @@ const cases: Case[] = [
       assert(/row\(s\) omitted/.test(out.budget_note ?? ""), "missing budget note");
       assert(out.data.total_matching === 1240, "metadata must survive capping");
       assert(out.data.tickets.length < 30, "rows should have been dropped");
+    },
+  },
+
+  // ---- Added in the pre-submission review (docs/REVIEW.md) ----
+  {
+    name: "tool declarations carry every parameter description",
+    why: "A PII warning the model never sees is not a guardrail; .describe() after .optional()/.default() used to be dropped.",
+    async run() {
+      const thread = zodToJsonSchema(tool("get_ticket_thread").schema) as any;
+      assert(/PII/.test(thread.properties.include_contact.description ?? ""), "include_contact lost its description");
+      assert(thread.properties.ticket_id.exclusiveMinimum === 0, "positive() must not be published as minimum: 0");
+      const list = zodToJsonSchema(tool("list_tickets").schema) as any;
+      assert(!!list.properties.cursor.description && !!list.properties.fields.description, "optional params lost descriptions");
+    },
+  },
+  {
+    name: "update_ticket add_tags merges with existing tags instead of replacing them",
+    why: "Freshdesk's PUT replaces the tag array; a tool called add_tags must not strip a merchant's fraud tag.",
+    async run() {
+      let sent: string[] | undefined;
+      const ctx = ctxWith(
+        recordedTransport([
+          (url, init) => {
+            if (/\/tickets\/10241$/.test(url.pathname) && init.method === "PUT") {
+              sent = JSON.parse(String(init.body)).tags;
+              return { status: 200, body: { ...TICKET_AUTOPAY, tags: sent } };
+            }
+            return undefined;
+          },
+          routes.ticketOk(), // answers the read-before-merge GET
+        ]),
+      );
+      await call(ctx, "update_ticket", { ticket_id: 10241, add_tags: ["triaged"], idempotency_key: "k-00000003", reason: "autopay triage complete" });
+      assert(JSON.stringify(sent) === JSON.stringify(["autopay", "subscription", "triaged"]), `expected merged tags, sent ${JSON.stringify(sent)}`);
+    },
+  },
+  {
+    name: "the same idempotency key on a different ticket is a different write",
+    why: "A cache keyed on the key alone returned ticket A's note for ticket B and silently skipped the write.",
+    async run() {
+      const posted: string[] = [];
+      const ctx = ctxWith(
+        recordedTransport([
+          (url, init) => {
+            if (url.pathname.endsWith("/notes") && init.method === "POST") {
+              posted.push(url.pathname);
+              return { status: 201, body: { id: 900 + posted.length, created_at: "x" } };
+            }
+            return undefined;
+          },
+        ]),
+      );
+      const a = await call(ctx, "add_private_note", { ticket_id: 1, body: "x", idempotency_key: "triage-run-7" });
+      const b = await call(ctx, "add_private_note", { ticket_id: 2, body: "x", idempotency_key: "triage-run-7" });
+      const again = await call(ctx, "add_private_note", { ticket_id: 2, body: "x", idempotency_key: "triage-run-7" });
+      assert(posted.length === 2, `expected two POSTs, got ${posted.length}`);
+      assert(a.data.note_id !== b.data.note_id, "ticket 2 was answered with ticket 1's note");
+      assert(b.data.replayed === false && again.data.replayed === true, "replayed flag must say which call was a no-op");
+    },
+  },
+  {
+    name: "an empty bucket hands parallel callers distinct slots",
+    why: "delayMs()+take() let every waiting caller wake together and overdraw the plan; reserve() queues them.",
+    async run() {
+      let t = 0;
+      const bucket = new TokenBucket(60, () => t);
+      for (let i = 0; i < 60; i++) assert(bucket.reserve() === 0, "a full bucket must not wait");
+      const waits = [bucket.reserve(), bucket.reserve(), bucket.reserve()];
+      assert(waits[0] > 0 && waits[1] > waits[0] && waits[2] > waits[1], `expected increasing waits, got ${waits}`);
+      bucket.syncTo(5);
+      assert(bucket.available === 0, "syncTo must never grant more than the server says");
+    },
+  },
+  {
+    name: "UPI ids, IFSC codes and GSTINs are redacted",
+    why: "A refund ticket in India carries a VPA, an account number and an IFSC — the email regex alone missed all three.",
+    async run() {
+      const out = redactPii("pay rahul@okaxis or 9876543210@ybl, IFSC HDFC0001234, GSTIN 27AAPFU0939F1ZV, mail a@b.co");
+      for (const leak of ["okaxis", "ybl", "HDFC0001234", "27AAPFU0939F1ZV", "a@b.co"]) {
+        assert(!out.includes(leak), `${leak} leaked: ${out}`);
+      }
+    },
+  },
+  {
+    name: "a long thread is paged so the agent sees the latest reply",
+    why: "The embed is the ten OLDEST messages; a triage agent that never sees the customer's last message is wrong on exactly the escalated tickets.",
+    async run() {
+      const { ticket, all } = longThread(14);
+      const ctx = ctxWith(
+        recordedTransport([
+          (url) => (/\/tickets\/10241$/.test(url.pathname) ? { status: 200, body: ticket } : undefined),
+          (url) => (/\/conversations$/.test(url.pathname) ? { status: 200, body: all } : undefined),
+        ]),
+      );
+      const out = await call(ctx, "get_ticket_thread", { ticket_id: 10241, max_messages: 3 });
+      assert(out.data.messages.at(-1).id === 14, `expected the newest message, got ${out.data.messages.at(-1).id}`);
+      assert(out.data.messages_omitted === 11, `expected 11 omitted, got ${out.data.messages_omitted}`);
+      assert(out.data.thread_complete === true, "a fully paged thread is complete");
+    },
+  },
+  {
+    name: "thread metadata survives budget truncation",
+    why: "When a busy ticket overflows the budget, the agent must still see thread_complete and messages_omitted, not just cut text.",
+    async run() {
+      const { ticket } = longThread(10);
+      const big = { ...ticket, conversations: ticket.conversations.map((c) => ({ ...c, body_text: "x".repeat(1500) })) };
+      const ctx = ctxWith(
+        recordedTransport([
+          (url) => (/\/tickets\/10241$/.test(url.pathname) ? { status: 200, body: big } : undefined),
+          (url) => (/\/conversations$/.test(url.pathname) ? { status: 200, body: big.conversations } : undefined),
+        ]),
+        { maxResponseChars: 3000 },
+      );
+      const out = await call(ctx, "get_ticket_thread", { ticket_id: 10241 });
+      assert(out.capped === true, "expected capped");
+      assert(/"thread_complete"/.test(String(out.data)) && /"messages_omitted"/.test(String(out.data)), "metadata was truncated away");
+    },
+  },
+  {
+    name: "a 5xx on a write is not retryable: the outcome is unknown",
+    why: "A 502 from a proxy after Freshdesk committed the note is how a blind retry creates a duplicate.",
+    async run() {
+      const ctx = ctxWith(recordedTransport([() => ({ status: 502, body: { message: "bad gateway" } })]));
+      try {
+        await call(ctx, "add_private_note", { ticket_id: 1, body: "x", idempotency_key: "k-00000004" });
+        throw new Error("expected failure");
+      } catch (e) {
+        assert(e instanceof FreshdeskError && e.detail.retryable === false, "write 5xx must not be retryable");
+        assert(/get_ticket_thread/.test(e.detail.remediation ?? ""), "must tell the agent to re-read before re-posting");
+      }
+    },
+  },
+  {
+    name: "a non-JSON 200 is an upstream error, not an internal one",
+    why: "A maintenance page should read as 'Freshdesk is broken, retry once', not 'the connector crashed'.",
+    async run() {
+      const ctx = ctxWith(async () => new Response("<!DOCTYPE html><p>maintenance</p>", { status: 200, headers: { "content-type": "text/html" } }));
+      try {
+        await call(ctx, "list_tickets", {});
+        throw new Error("expected failure");
+      } catch (e) {
+        assert(e instanceof FreshdeskError && e.detail.kind === "upstream_error" && e.detail.retryable === true, "wrong classification");
+        assert(!/DOCTYPE/.test(e.detail.message), "upstream body must not leak into the message");
+      }
+    },
+  },
+  {
+    name: "unknown argument keys are rejected, not silently ignored",
+    why: "The published schema says additionalProperties: false; a typo'd filter must not return an unfiltered page with ok: true.",
+    async run() {
+      const r = tool("list_tickets").schema.safeParse({ statuss: "open" });
+      assert(!r.success && /statuss/.test(JSON.stringify(r.error.issues)), "typo'd key was accepted");
+    },
+  },
+  {
+    name: "offset timestamps are accepted and sent to Freshdesk as UTC",
+    why: "An Indian merchant's agent will be told 'since 6 May, 11:59pm IST'; rejecting +05:30 is a dead end.",
+    async run() {
+      let sent: string | null = null;
+      const ctx = ctxWith(
+        recordedTransport([
+          (url) => {
+            sent = url.searchParams.get("updated_since");
+            return { status: 200, body: [] };
+          },
+        ]),
+      );
+      await call(ctx, "list_tickets", { updated_since: "2026-05-06T23:59:59+05:30" });
+      assert(sent === "2026-05-06T18:29:59.000Z", `expected UTC, sent ${sent}`);
+    },
+  },
+  {
+    name: "search literals cannot break out of the query",
+    why: "The query is double-quoted and literals single-quoted; a stray quote in a tag must not rewrite the filter.",
+    async run() {
+      let sent: string | null = null;
+      const ctx = ctxWith(
+        recordedTransport([
+          (url) => {
+            sent = url.searchParams.get("query");
+            return { status: 200, body: { results: [], total: 0 } };
+          },
+        ]),
+      );
+      await call(ctx, "search_tickets", { tag: `a"b' OR status:2\u0000` });
+      assert(sent === `"tag:'ab OR status:2'"`, `unexpected query ${sent}`);
+    },
+  },
+  {
+    name: "every request carries a timeout",
+    why: "A stalled connection must not hold a concurrency slot for five minutes; the timeout has to be wired, not assumed.",
+    async run() {
+      let signal: unknown;
+      const ctx = ctxWith(async (url, init) => {
+        signal = init.signal;
+        return new Response("[]", { status: 200 });
+      });
+      await call(ctx, "list_tickets", {});
+      assert(signal instanceof AbortSignal, "no AbortSignal on the request");
+    },
+  },
+  {
+    name: "unredacted access and state changes leave audit lines",
+    why: "The docs promise both are logged; a compliance reader will grep for them.",
+    async run() {
+      const ctx = ctxWith(recordedTransport([routes.ticketOk(), routes.updateOk()]));
+      const lines = await captureStderr(async () => {
+        await call(ctx, "get_ticket_thread", { ticket_id: 10241, include_contact: true });
+        await call(ctx, "update_ticket", { ticket_id: 10241, status: "resolved", idempotency_key: "k-00000005", reason: "duplicate of 10240" });
+      });
+      assert(lines.some((l) => /"event":"pii_unredacted".*"ticket_id":10241/.test(l)), "include_contact was not logged");
+      assert(lines.some((l) => /"event":"state_change".*"reason":"duplicate of 10240"/.test(l)), "update reason was not logged");
     },
   },
 ];

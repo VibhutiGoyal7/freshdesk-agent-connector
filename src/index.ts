@@ -40,7 +40,8 @@ async function main(): Promise<void> {
       annotations: {
         readOnlyHint: t.effect === "read",
         destructiveHint: false,
-        idempotentHint: t.effect !== "write_state",
+        // Both writes are keyed and cached, so a repeat with the same key is a no-op.
+        idempotentHint: true,
       },
     })),
   }));

@@ -47,15 +47,33 @@ export class TokenBucket {
     this.tokens = Math.max(0, this.tokens - 1);
   }
 
+  /**
+   * Reserve a token now and return how long to wait before using it. Unlike
+   * delayMs()+take(), parallel callers each get their own slot: an empty bucket
+   * hands the first caller 0 ms, the second one refill interval, and so on,
+   * rather than waking all of them together.
+   */
+  reserve(): number {
+    this.refill();
+    this.tokens -= 1;
+    return this.tokens >= 0 ? 0 : Math.ceil(-this.tokens / this.refillPerMs);
+  }
+
+  /** Freshdesk's X-RateLimit-Remaining is authoritative; never believe we have more than it says. */
+  syncTo(remaining: number): void {
+    this.refill();
+    this.tokens = Math.min(this.tokens, remaining);
+  }
+
   /** Called after a real 429: assume our estimate was wrong and stop entirely. */
   drain(): void {
     this.refill();
-    this.tokens = 0;
+    this.tokens = Math.min(0, this.tokens);
   }
 
   get available(): number {
     this.refill();
-    return Math.floor(this.tokens);
+    return Math.max(0, Math.floor(this.tokens));
   }
 }
 

@@ -14,7 +14,8 @@
               "pending",
               "resolved",
               "closed"
-            ]
+            ],
+            "description": "Only tickets in this state."
           },
           "priority": {
             "type": "string",
@@ -27,7 +28,8 @@
           },
           "updated_since": {
             "type": "string",
-            "format": "date-time"
+            "format": "date-time",
+            "description": "ISO-8601, any offset (e.g. +05:30). Only tickets updated at or after this instant."
           },
           "limit": {
             "type": "integer",
@@ -36,13 +38,16 @@
             "default": 20
           },
           "cursor": {
-            "type": "string"
+            "type": "string",
+            "description": "Page cursor from a previous call's next_cursor. Omit for the first page. Reuse the same limit and updated_since with it, or pages will overlap or skip."
           },
           "fields": {
             "type": "array",
             "items": {
               "type": "string"
-            }
+            },
+            "maxItems": 20,
+            "description": "Return only these fields of each ticket (e.g. ['id','subject','status']). Use it when scanning many tickets: it cuts the response several-fold."
           }
         },
         "additionalProperties": false
@@ -79,14 +84,16 @@
             ]
           },
           "tag": {
-            "type": "string"
+            "type": "string",
+            "description": "Exact tag match, e.g. 'autopay'."
           },
           "type": {
             "type": "string"
           },
           "created_after": {
             "type": "string",
-            "format": "date-time"
+            "format": "date-time",
+            "description": "ISO-8601. Freshdesk search filters by calendar date, so the time of day is dropped."
           },
           "page": {
             "type": "integer",
@@ -98,7 +105,8 @@
             "type": "array",
             "items": {
               "type": "string"
-            }
+            },
+            "maxItems": 20
           }
         },
         "additionalProperties": false
@@ -112,13 +120,13 @@
     {
       "name": "get_ticket_thread",
       "title": "Get one ticket with its conversation",
-      "description": "Fetch a single ticket with its message thread, oldest first, as plain text. Freshdesk embeds at most the 10 most recent messages; thread_complete tells you whether older messages exist beyond what is returned. This is the expensive call — use it on the handful of tickets you have already narrowed to.",
+      "description": "Fetch a single ticket with its message thread, oldest first, as plain text. Returns the most recent max_messages messages; thread_complete tells you whether older messages exist beyond what is returned. This is the expensive call — use it on the handful of tickets you have already narrowed to. A busy thread can exceed the response budget: lower max_messages or max_chars_per_message if the result is capped.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "ticket_id": {
             "type": "integer",
-            "minimum": 0
+            "exclusiveMinimum": 0
           },
           "max_messages": {
             "type": "integer",
@@ -134,7 +142,8 @@
           },
           "include_contact": {
             "type": "boolean",
-            "default": false
+            "default": false,
+            "description": "Leave ticket and message text unredacted (emails, UPI ids, phone numbers — and any card/PAN/Aadhaar-shaped strings the customer typed). It does not fetch the contact record. Only set this when the task genuinely needs it; it puts customer PII into the model's context and is logged."
           }
         },
         "required": [
@@ -151,13 +160,13 @@
     {
       "name": "add_private_note",
       "title": "Add an internal note",
-      "description": "Attach an internal note to a ticket. The customer never sees it. This is the agent's default way to record a finding, a draft reply for a human to send, or a recommended action. Idempotent: pass a stable idempotency_key and a retry will not create a duplicate.",
+      "description": "Attach an internal note to a ticket. The customer never sees it. This is the agent's default way to record a finding, a draft reply for a human to send, or a recommended action. Idempotent within a connector process: re-sending a call that already succeeded with the same idempotency_key and ticket_id returns the cached result (replayed: true) instead of posting again.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "ticket_id": {
             "type": "integer",
-            "minimum": 0
+            "exclusiveMinimum": 0
           },
           "body": {
             "type": "string",
@@ -187,13 +196,13 @@
     {
       "name": "update_ticket",
       "title": "Update ticket state",
-      "description": "Change a ticket's status, priority or tags. This is visible in the merchant's helpdesk and in their SLA reporting, so it is gated on human approval by default. It cannot send anything to the customer — there is no tool in this connector that can.",
+      "description": "Change a ticket's status, priority or tags. This is visible in the merchant's helpdesk and in their SLA reporting, so it is gated on human approval by default. It cannot author anything to the customer — there is no tool in this connector that can — but resolving or closing a ticket may trigger the merchant's own Freshdesk notifications and automations. add_tags merges with the ticket's existing tags; it never removes any.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "ticket_id": {
             "type": "integer",
-            "minimum": 0
+            "exclusiveMinimum": 0
           },
           "status": {
             "type": "string",
@@ -241,7 +250,7 @@
       "annotations": {
         "readOnlyHint": false,
         "destructiveHint": false,
-        "idempotentHint": false
+        "idempotentHint": true
       }
     }
   ]

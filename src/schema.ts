@@ -30,9 +30,11 @@ function convert(s: z.ZodTypeAny): Record<string, unknown> {
       additionalProperties: false,
     });
   }
-  if (s instanceof z.ZodOptional) return convert(def.innerType);
+  // zod hangs .describe() on the outermost wrapper, so Optional/Default must
+  // carry the description through or the model never sees it.
+  if (s instanceof z.ZodOptional) return withDesc(convert(def.innerType));
   if (s instanceof z.ZodDefault) {
-    return { ...convert(def.innerType), default: def.defaultValue() };
+    return withDesc({ ...convert(def.innerType), default: def.defaultValue() });
   }
   if (s instanceof z.ZodArray) {
     return withDesc({
@@ -54,8 +56,10 @@ function convert(s: z.ZodTypeAny): Record<string, unknown> {
   if (s instanceof z.ZodNumber) {
     const checks: Record<string, unknown> = {};
     for (const c of def.checks ?? []) {
-      if (c.kind === "min") checks.minimum = c.value;
-      if (c.kind === "max") checks.maximum = c.value;
+      // .positive() is an exclusive bound; emitting minimum: 0 would tell the
+      // model that 0 is a valid id.
+      if (c.kind === "min") checks[c.inclusive === false ? "exclusiveMinimum" : "minimum"] = c.value;
+      if (c.kind === "max") checks[c.inclusive === false ? "exclusiveMaximum" : "maximum"] = c.value;
       if (c.kind === "int") checks.type = "integer";
     }
     return withDesc({ type: "number", ...checks });

@@ -40,14 +40,15 @@ const main = async () => {
   show("search_tickets", await run("search_tickets", { status: "open" }));
 
   if (process.argv.includes("--write")) {
-    show(
-      "add_private_note",
-      await run("add_private_note", {
-        ticket_id: first,
-        body: "Connector smoke test: internal note, not visible to the customer.",
-        idempotency_key: `smoke-${first}-${new Date().toISOString().slice(0, 13)}`,
-      }),
-    );
+    // Same key twice: the second call must be answered from the idempotency
+    // cache (replayed: true) and post nothing.
+    const args = {
+      ticket_id: first,
+      body: "Connector smoke test: internal note, not visible to the customer.",
+      idempotency_key: `smoke-${first}-${new Date().toISOString().slice(0, 13)}`,
+    };
+    show("add_private_note", await run("add_private_note", args));
+    show("add_private_note (same key again)", await run("add_private_note", args));
   }
 };
 

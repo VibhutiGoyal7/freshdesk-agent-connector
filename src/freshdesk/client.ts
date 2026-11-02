@@ -28,9 +28,15 @@ export interface FreshdeskResponse<T> {
   rateLimitRemaining?: number;
   /** Present on list endpoints that paginate via Link headers. */
   nextPage?: number;
+  /** True when a write was answered from the idempotency cache and nothing was sent. */
+  replayed?: boolean;
 }
 
 const MAX_ATTEMPTS = 4;
+/** A stalled connection must not hold a concurrency slot for undici's 5-minute default. */
+const REQUEST_TIMEOUT_MS = 30_000;
+/** One entry per successful write for the life of the process; FIFO beyond this. */
+const WRITE_CACHE_MAX = 1000;
 
 export class FreshdeskClient {
   private readonly bucket: TokenBucket;
@@ -61,17 +67,19 @@ export class FreshdeskClient {
   async request<T>(opts: RequestOptions): Promise<FreshdeskResponse<T>> {
     const method = opts.method ?? "GET";
 
-    if (opts.idempotencyKey && this.writeCache.has(opts.idempotencyKey)) {
+    // Scoped to the request, not just the key: the same key on a different
+    // ticket is a different write, not a replay.
+    const cacheKey = opts.idempotencyKey && `${method} ${opts.path} ${opts.idempotencyKey}`;
+    if (cacheKey && this.writeCache.has(cacheKey)) {
       log.info({ tool: opts.tool, event: "idempotent_replay", key: opts.idempotencyKey });
-      return { data: this.writeCache.get(opts.idempotencyKey) as T };
+      return { data: this.writeCache.get(cacheKey) as T, replayed: true };
     }
 
     const release = await this.gate.acquire();
     const started = Date.now();
     try {
       for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-        await sleep(this.bucket.delayMs());
-        this.bucket.take();
+        await sleep(this.bucket.reserve());
 
         let res: Response;
         try {
@@ -84,6 +92,7 @@ export class FreshdeskClient {
               "User-Agent": "agent-studio-freshdesk-connector/0.1",
             },
             body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
+            signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
           });
         } catch (cause) {
           // Network-level failure: retry a GET, surface a write immediately so we
@@ -101,6 +110,8 @@ export class FreshdeskClient {
         }
 
         const remaining = numHeader(res, "x-ratelimit-remaining");
+        // Embedded-data requests cost Freshdesk more than one call; its count wins.
+        if (remaining !== undefined) this.bucket.syncTo(remaining);
 
         if (res.status === 429) {
           const retryAfter = numHeader(res, "retry-after") ?? 60;
@@ -122,13 +133,37 @@ export class FreshdeskClient {
 
         if (!res.ok) {
           log.warn({ tool: opts.tool, event: "upstream_error", status: res.status });
-          throw new FreshdeskError(classifyHttp(res.status));
+          const detail = classifyHttp(res.status);
+          if (method !== "GET" && res.status >= 500) {
+            // A 502 from a proxy after Freshdesk committed the write is the
+            // unknown-outcome case: a blind retry is how duplicate notes happen.
+            detail.retryable = false;
+            detail.remediation =
+              "Outcome unknown: re-read the ticket with get_ticket_thread before re-posting, and use a new idempotency_key if you do.";
+          }
+          throw new FreshdeskError(detail);
         }
 
         const text = await res.text();
-        const data = (text ? JSON.parse(text) : null) as T;
+        let data: T;
+        try {
+          data = (text ? JSON.parse(text) : null) as T;
+        } catch {
+          // A maintenance page or captive portal, not a connector bug.
+          throw new FreshdeskError({
+            kind: "upstream_error",
+            message: `Freshdesk returned a non-JSON body with status ${res.status}.`,
+            retryable: true,
+            remediation: "Retry once; if it persists, report an upstream outage rather than looping.",
+          });
+        }
 
-        if (opts.idempotencyKey) this.writeCache.set(opts.idempotencyKey, data);
+        if (cacheKey) {
+          this.writeCache.set(cacheKey, data);
+          if (this.writeCache.size > WRITE_CACHE_MAX) {
+            this.writeCache.delete(this.writeCache.keys().next().value as string);
+          }
+        }
 
         log.info({
           tool: opts.tool,
@@ -137,6 +172,7 @@ export class FreshdeskClient {
           path: opts.path,
           status: res.status,
           ms: Date.now() - started,
+          attempt,
           rate_remaining: remaining ?? this.bucket.available,
         });
 

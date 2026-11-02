@@ -97,9 +97,15 @@ export function stripHtml(input: string | null | undefined): string {
 export function redactPii(text: string): string {
   return text
     .replace(/\b\d{4}[ -]?\d{4}[ -]?\d{4}[ -]?\d{4}\b/g, "[card-redacted]")
+    .replace(/\b3[47]\d{2}[ -]?\d{6}[ -]?\d{5}\b/g, "[card-redacted]")
+    // GSTIN embeds a PAN, so it has to go before the PAN rule.
+    .replace(/\b\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z]\b/g, "[gstin-redacted]")
     .replace(/\b[A-Z]{5}\d{4}[A-Z]\b/g, "[pan-redacted]")
-    .replace(/\b\d{4}\s?\d{4}\s?\d{4}\b/g, "[aadhaar-redacted]")
-    .replace(/[\w.+-]+@[\w-]+\.[\w.]+/g, "[email-redacted]")
+    .replace(/\b[A-Z]{4}0[A-Z0-9]{6}\b/g, "[ifsc-redacted]")
+    .replace(/\b\d{4}[ -]?\d{4}[ -]?\d{4}\b/g, "[aadhaar-redacted]")
+    // No dot required after the @: a UPI VPA (rahul@okaxis) is as identifying
+    // as an email address and far more common in a payments ticket.
+    .replace(/[\w.+-]+@[\w-]+(?:\.[\w-]+)*/g, "[email-redacted]")
     // Indian mobile numbers turn up spaced, hyphenated and with or without the
     // country code; all four shapes have to go.
     .replace(/(?:\+?91[\s-]?)?[6-9]\d{4}[\s-]?\d{5}(?!\d)/g, "[phone-redacted]");
@@ -164,7 +170,7 @@ export function capPayload<T>(value: T, maxChars: number): { value: T | string; 
   return {
     value:
       s.slice(0, maxChars) +
-      `\n…[truncated at ${maxChars} characters. Narrow the query or request fewer fields.]`,
+      `\n…[truncated at ${maxChars} characters. Narrow the query, request fewer fields, or lower max_messages / max_chars_per_message.]`,
     capped: true,
   };
 }

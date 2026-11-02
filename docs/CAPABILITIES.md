@@ -19,9 +19,9 @@ The operational cost is triage: a human reads every ticket to decide which are
 payment problems, which are urgent, and which need a payments person rather than
 a support person. That reading is the work an agent can take over.
 
-So the target metric for anything built on this connector is **time-to-correct-
-routing** on payment-related tickets, with **mis-routing rate** as the guardrail
-metric. Not tickets closed, and not replies sent — see §5.
+So the target metric for anything built on this connector is
+**time-to-correct-routing** on payment-related tickets, with **mis-routing rate**
+as the guardrail metric. Not tickets closed, and not replies sent — see §5.
 
 ## 2. What the agent can do
 
@@ -29,7 +29,7 @@ metric. Not tickets closed, and not replies sent — see §5.
 |---|---|---|---|
 | `list_tickets` | read | none | Scan the queue in recency order. Compact summaries. |
 | `search_tickets` | read | none | Server-side filter by status, priority, tag, type, created-after. |
-| `get_ticket_thread` | read | none | One ticket, full conversation, plain text. The expensive call. |
+| `get_ticket_thread` | read | none | One ticket, its latest messages, plain text. The expensive call. |
 | `add_private_note` | write, internal | none | Record a finding or draft a reply for a human. Invisible to the customer. |
 | `update_ticket` | write, state | **required** | Change status, priority or tags. Visible in the merchant's SLA reporting. |
 
@@ -69,11 +69,12 @@ these are the operations where a wrong call is expensive and hard to walk back.
 **It cannot read attachments.** Payment screenshots are common in these tickets
 and the agent is blind to them. This is the most-felt gap; see §7.
 
-**It may not see a whole thread.** Freshdesk embeds only the latest ten
-messages when a ticket is fetched. The connector reports `thread_complete:
-false` when older messages exist, so the agent knows it is reading an excerpt
-rather than assuming it has everything. Paginating the rest is first on the
-v0.2 list.
+**It may not see a whole thread.** Freshdesk embeds only the ten *oldest*
+messages when a ticket is fetched — not the latest, which is the one a triage
+agent needs. When the embed is full the connector pages the real thread (up to
+90 messages) and returns the most recent `max_messages`. Beyond that it reports
+`thread_complete: false`, so the agent knows it is reading an excerpt rather
+than assuming it has everything.
 
 **It will not see tickets older than 30 days unless asked.** Freshdesk's list
 endpoint defaults to the last 30 days of updates. `list_tickets` states the
@@ -92,8 +93,9 @@ with refresh, and nothing above it changes.
 ## 4. Behaviour under load and failure
 
 **Rate limits.** Freshdesk's limit is per-plan and per-minute. The connector runs
-a token bucket sized to the configured plan ceiling, so it stays under the limit
-rather than discovering it by being throttled. Being throttled is not a neutral
+a token bucket sized to the configured plan ceiling, corrected downward from
+Freshdesk's `X-RateLimit-Remaining` on every response, so it stays at or under
+the limit rather than discovering it by being throttled. Being throttled is not a neutral
 event for an agent: the model has already spent tokens deciding to make the call.
 
 On a real 429 the connector trusts the server over its own estimate: it drains
@@ -105,13 +107,17 @@ decision the agent should make, possibly by narrowing its query instead.
 **Errors.** Every failure arrives as `{ ok: false, error: { kind, message,
 retryable, remediation } }`. The `retryable` flag matters more than it looks: an
 agent that loops on a revoked API key overnight is a real incident, so 401 and
-422 are explicitly non-retryable and say that a human must act.
+422 are explicitly non-retryable: 401 says a human must act, 422 says fix the
+arguments. Every request carries a 30-second timeout so a stalled connection
+cannot hold a concurrency slot.
 
-**Writes.** Both write tools take an `idempotency_key` and the connector caches
-the response against it. Agents retry; a merchant's ticket must not collect three
-identical notes. Network failures on writes are surfaced immediately rather than
-retried, because a timed-out POST may already have succeeded and the connector
-cannot see which.
+**Writes.** Both write tools take an `idempotency_key`, scoped to the ticket and
+tool, and the connector caches the response against it; a replay is marked
+`replayed: true` in the result. Agents retry; a merchant's ticket must not
+collect three identical notes. Network failures *and* 5xx responses on writes
+are surfaced as non-retryable rather than retried, because a timed-out or
+proxied POST may already have succeeded and the connector cannot see which —
+the agent is told to re-read the ticket before posting again.
 
 **Context budget.** Treated as a production constraint, not a nicety — it sets
 how many tickets an agent can hold before it starts forgetting. The connector
@@ -120,10 +126,13 @@ plain text, previews are truncated with a visible marker, `fields` lets a caller
 ask for three columns instead of forty, and oversized list responses shed rows
 while keeping their totals and cursors intact.
 
-**PII.** Card numbers, phone numbers, emails, PAN and Aadhaar-shaped strings are
-redacted from tool output by default. Full contact details are available through
-`get_ticket_thread` with `include_contact: true`, which is logged. Redaction is
-coarse on purpose: a false positive costs the model nothing.
+**PII.** Card numbers (including Amex), phone numbers, email and UPI ids, PAN,
+Aadhaar, GSTIN and IFSC-shaped strings are redacted from ticket text by default.
+`get_ticket_thread` with `include_contact: true` leaves the text unredacted and
+writes a `pii_unredacted` audit line; it does not fetch the contact record.
+Redaction is coarse on purpose and has a known cost: a 12- or 16-digit payment
+reference (UTR, RRN) looks like an Aadhaar or card number and is redacted too,
+so an agent that needs one must ask a human or use `include_contact`.
 
 ## 5. Where a human stands in the loop
 
@@ -133,6 +142,12 @@ coarse on purpose: a false positive costs the model nothing.
 | Recording a judgement as an internal note | Agent, alone — reversible and invisible to the customer |
 | Changing status, priority or tags | Agent proposes with a written `reason`, human approves |
 | Anything a customer sees | Human, always. The agent drafts. |
+
+One caveat the approver must know: resolving or closing a ticket can trigger the
+merchant's own Freshdesk notifications and automations ("agent solved your
+ticket"). The connector authors nothing to the customer, but a status change is
+not silent. For a pilot, keep `status` to `open`/`pending` or disable those two
+notifications for the API agent.
 
 The line is drawn at **reversibility and visibility**, not at confidence. A
 confident agent and a reckless one produce the same tool calls; only the blast
@@ -149,19 +164,23 @@ Set before rollout, not after:
 - **Shadow first.** Run read-only for a week against the live queue. The agent
   writes its routing judgement to an internal note; nothing changes. Compare
   against what the humans actually did.
-- **Ship when** agreement with human triage exceeds ~90% on payment-related
-  tickets, measured on a sample a human re-reads.
-- **Then measure** median time-to-correct-routing against the pre-rollout
-  baseline. That is the number that justifies the agent existing.
-- **Guardrail:** mis-routing rate must not rise. If routing gets faster and
+- **Ship when** agreement with human triage is ≥ 90% on payment-related
+  tickets, measured on a sample of at least 200 a human re-reads.
+- **Then measure** median time-to-correct-routing against the four-week
+  pre-rollout baseline, weekly, from Freshdesk's audit timestamps (ticket
+  created → first priority or tag set). That is the number that justifies the
+  agent existing.
+- **Guardrail:** mis-routing rate (tickets a human re-tags after the agent) must
+  stay within two percentage points of baseline. If routing gets faster and
   worse, the agent is a regression wearing a dashboard.
-- **Kill criterion** stated up front: if after four weeks time-to-routing has not
-  improved by a meaningful margin, the right outcome is to switch it off and say
+- **Kill criterion** stated up front: if at week four time-to-routing is less
+  than 15% better than baseline, the right outcome is to switch it off and say
   so, not to keep tuning prompts.
 
-Every tool call emits a structured stderr line with latency, status, retry count
-and rate-limit headroom — the numbers you need when the merchant asks why the
-agent was slow, and the numbers an eval pack grades against.
+Every upstream call emits a structured stderr line with latency, status, attempt
+number and rate-limit headroom; unredacted PII access and every approved state
+change emit their own audit lines. These are the numbers you need when the
+merchant asks why the agent was slow, and two eval cases assert on them.
 
 ## 7. What I'd build next, and what belongs in the platform
 
@@ -200,9 +219,24 @@ underneath is the same every time, and it is where a platform earns its keep.
   fetching a page, so a page can return fewer rows than `limit`. The response
   says so. `search_tickets` filters server-side and should be preferred.
 - Rate limits are configured, not discovered. If the merchant's plan changes,
-  `FRESHDESK_RATE_LIMIT_PER_MINUTE` must change with it.
-- The idempotency cache is in-process. A restart loses it. A real deployment
-  wants Redis, which is three lines here and a platform concern in general.
+  `FRESHDESK_RATE_LIMIT_PER_MINUTE` must change with it (default 100 if unset).
+  The bucket starts full, so a cold start can burst up to the ceiling in its
+  first second; Freshdesk's own remaining-count header then corrects it.
+- The idempotency cache is in-process and capped at 1,000 keys (FIFO). A
+  restart loses it. A real deployment wants Redis, which is three lines here
+  and a platform concern in general.
+- `update_ticket` with `add_tags` reads the ticket and merges before writing;
+  a tag a human adds between that read and the write is lost.
+- Threads are paged to 90 messages; `thread_complete: false` beyond that.
+- `list_tickets` cursors are page numbers, not bound to `limit` or
+  `updated_since`; reuse them with the same arguments.
+- On a 400/422 the connector reports "malformed" without Freshdesk's own field
+  message, so the agent knows *that* an argument was rejected but not which.
+- Redaction catches 12- and 16-digit payment references (see §4). Luhn and
+  Verhoeff checks would separate card/Aadhaar from UTR/RRN; not done yet.
+- `npm audit` reports one high in `zod` (GHSA-mrhx-c7xc-m3w5, oversized array
+  inputs). Every array argument is bounded (`maxItems` ≤ 20) and the only caller
+  is the agent host over stdio; the fix is a major bump to zod 4, deferred.
 - Only ticket objects are modelled. Contacts, companies, SLA policies and
   time entries are untouched.
 - Rate-limit ceilings and search caps follow Freshdesk's documented behaviour at

@@ -54,13 +54,13 @@ merchant's helpdesk, so they cannot join *what happened to the money* with
 
 | Metric | Type | Target |
 |---|---|---|
-| Agreement with human triage on payment-related tickets | Gate to ship | ≥ 90% on a human-reviewed sample, after one week in shadow mode |
-| Median time-to-correct-routing | Primary | Measurable improvement over the pre-rollout baseline within four weeks |
-| Mis-routing rate | Guardrail | Must not rise |
+| Agreement with human triage on payment-related tickets | Gate to ship | ≥ 90% on a human-reviewed sample of ≥ 200 tickets, after one week in shadow mode |
+| Median time-to-correct-routing (ticket created → first priority/tag set, from Freshdesk audit timestamps) | Primary | ≥ 30% lower than the four-week pre-rollout baseline, measured weekly by the merchant's support lead |
+| Mis-routing rate (tickets a human re-tags after the agent) | Guardrail | ≤ baseline + 2 percentage points |
 | Customer-visible actions taken by the agent | Guardrail | Zero, by construction |
 
-**Kill criterion**, stated now so it can't be negotiated later: if after four
-weeks time-to-routing has not improved meaningfully, the agent is switched off
+**Kill criterion**, stated now so it can't be negotiated later: if at week four
+time-to-routing is less than 15% better than baseline, the agent is switched off
 and the result written up. Tuning prompts indefinitely is not an outcome.
 
 ## 5. Requirements
@@ -107,7 +107,7 @@ The line is drawn at **reversibility and visibility**, not at model confidence.
 | Decision | Alternative rejected | Why |
 |---|---|---|
 | Five workflow-shaped tools | Mirror the Freshdesk API | A mirror makes the model do integration work at inference time, badly. Context budget is a production constraint. |
-| Customer-facing write tool **absent**, not disabled | Expose `reply` behind a flag | A tool the model cannot see is a tool no prompt injection can invoke. |
+| Customer-facing write tool **absent**, not disabled | Expose `reply` behind a flag | A tool the model cannot see is a tool no prompt injection can invoke. `ALLOW_CUSTOMER_FACING_WRITES` exists as a future gate but gates nothing: no such tool is in the codebase, and adding one is a reviewed code change, not a config flip. |
 | API key auth | OAuth | Freshdesk's REST API authenticates with per-agent API keys; it does not offer OAuth for API access. For Zoho or Freshworks' newer surfaces the same `client.ts` would carry an OAuth2 refresh-token flow in place of `authHeader()` — the tool layer is unchanged. |
 | Rate limit configured, not discovered | Probe until 429 | Being throttled costs the agent a turn it has already paid for. |
 | Short 429s absorbed, long ones surfaced | Always retry / never retry | A two-second wait is plumbing. A two-minute wait is a decision the agent should make. |
@@ -116,8 +116,8 @@ The line is drawn at **reversibility and visibility**, not at model confidence.
 
 ## 8. Rollout
 
-1. **Shadow (week 1).** Read-only against the live queue. Agent writes its routing judgement to an internal note. Humans triage as normal. Compare.
-2. **Assist (weeks 2–4).** `update_ticket` enabled with approval. Agent proposes priority and tags; support lead approves in Freshdesk.
+1. **Shadow (week 1).** No state changes against the live queue. Agent writes its routing judgement to an internal note. Humans triage as normal. Compare.
+2. **Assist (weeks 2–4).** `update_ticket` enabled with approval. Agent proposes priority and tags; support lead approves in the agent host's approval surface.
 3. **Review (end of week 4).** Metrics in §4 against baseline. Ship, iterate, or kill.
 
 ## 9. Risks
@@ -127,7 +127,8 @@ The line is drawn at **reversibility and visibility**, not at model confidence.
 | Agent mis-classifies a payment ticket as non-payment and it waits | Mis-routing rate is a guardrail metric; shadow mode first |
 | Prompt injection via ticket body tries to drive a write | No customer-facing tool exists; state changes need approval; notes are internal |
 | Freshdesk plan limit lower than configured → sustained 429s | `Retry-After` honoured; long waits surfaced so the agent narrows instead of looping |
-| Long thread silently truncated by Freshdesk's 10-conversation embed | `thread_complete` flag; follow-up pagination is the first v0.2 item |
+| Freshdesk's 10-conversation embed is the ten *oldest* messages | Connector pages the full thread (to 90) and returns the latest; `thread_complete` flag beyond that |
+| Resolving/closing via `update_ticket` fires the merchant's own requester notifications | Documented for the approver (CAPABILITIES §5); pilot keeps `status` to open/pending |
 | Payment screenshots unreadable → agent blind to key evidence | Documented as the top gap; attachment OCR is v0.2 |
 
 ## 10. Open questions
