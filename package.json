@@ -13,6 +13,7 @@
     "dev": "tsx src/index.ts",
     "evals": "tsx evals/run.ts",
     "smoke": "tsx scripts/smoke.ts",
+    "seed": "tsx scripts/seed.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "agent": "tsx examples/run-agent.ts"
   },
